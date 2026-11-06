@@ -214,6 +214,9 @@ def build_clean_h3_upscale(
     return clean, positive_out, negative_out
 
 
+_DRIFT_CONTROL_WRAPPER_KEY = "minimax_h3_timeline_drift_control_av"
+
+
 def _strip_foreign_denoise_mask_patch(model: Any) -> Any:
     """Drop any dynamic denoise-mask patch the MODEL carries into the
     refinement pass — on a clone, never the shared graph object.
@@ -228,19 +231,42 @@ def _strip_foreign_denoise_mask_patch(model: Any) -> Any:
         ValueError: Drift-Control AV packed mask does not match its
         audio stream
 
-    (the F3-14 operator burn, 2026-11-05). The patch's apply-model
-    wrapper only reads state its own mask function sets, so with the
-    function gone it degrades to a pass-through — stripping the one
-    seat is complete. The original MODEL keeps its patch for every
-    other consumer in the graph.
+    (the F3-14 operator burn, 2026-11-05). The patch installs TWO
+    seats: the denoise-mask function AND an apply-model wrapper that
+    splits its own packed mask on the self-lift path — a path that
+    never rides the function. Stripping only the function left the
+    wrapper live with its self-lift-armed state (shared across model
+    clones), and the SECOND window's handoff died with the same
+    ValueError 21 nodes into the bill (the 2026-11-16 operator
+    burn, MinimaxH3LatentUpscaler3DRefineHandoff.1). The strip is
+    therefore complete: function, wrapper, and the state handle all
+    go. The original MODEL keeps its patch for every other consumer
+    in the graph.
     """
     options = getattr(model, "model_options", None)
     if not isinstance(options, dict):
         return model
-    if not callable(options.get("denoise_mask_function")):
+    wrappers = getattr(model, "get_wrappers", None)
+    foreign_wrapper = (
+        callable(wrappers)
+        and bool(wrappers("apply_model", _DRIFT_CONTROL_WRAPPER_KEY))
+    )
+    if not callable(options.get("denoise_mask_function")) and not foreign_wrapper:
         return model
     stripped = model.clone()
     stripped.model_options.pop("denoise_mask_function", None)
+    stripped.model_options.pop(_DRIFT_CONTROL_WRAPPER_KEY, None)
+    if foreign_wrapper:
+        remove = getattr(stripped, "remove_wrappers_with_key", None)
+        if not callable(remove):
+            raise RuntimeError(
+                "The refinement strip requires current ComfyUI wrapper "
+                "removal (remove_wrappers_with_key) — the foreign "
+                "Drift-Control apply-model wrapper cannot be disarmed"
+            )
+        # "apply_model" is WrappersMP.APPLY_MODEL's own value — spelled
+        # literally so this pass never imports the engine's enum module.
+        remove("apply_model", _DRIFT_CONTROL_WRAPPER_KEY)
     return stripped
 
 
