@@ -214,6 +214,36 @@ def build_clean_h3_upscale(
     return clean, positive_out, negative_out
 
 
+def _strip_foreign_denoise_mask_patch(model: Any) -> Any:
+    """Drop any dynamic denoise-mask patch the MODEL carries into the
+    refinement pass — on a clone, never the shared graph object.
+
+    The refinement owns its schedule: a partial-denoise second pass
+    over the learned enlarged latent. A dynamic denoise-mask
+    function installed upstream (Drift-Control AV, seeded from the
+    carried window latent at its own install time) splits the packed
+    denoise mask by those install-time stream shapes; the enlarged
+    grid no longer splits that way and the sampler dies mid-bill:
+
+        ValueError: Drift-Control AV packed mask does not match its
+        audio stream
+
+    (the F3-14 operator burn, 2026-11-05). The patch's apply-model
+    wrapper only reads state its own mask function sets, so with the
+    function gone it degrades to a pass-through — stripping the one
+    seat is complete. The original MODEL keeps its patch for every
+    other consumer in the graph.
+    """
+    options = getattr(model, "model_options", None)
+    if not isinstance(options, dict):
+        return model
+    if not callable(options.get("denoise_mask_function")):
+        return model
+    stripped = model.clone()
+    stripped.model_options.pop("denoise_mask_function", None)
+    return stripped
+
+
 def _make_guider(model: Any, positive: list, negative: list | None, cfg: float):
     try:
         import comfy.samplers
@@ -306,6 +336,10 @@ def run_h3_refinement(
     if lock_audio:
         generated_noise = _zero_audio_noise(generated_noise, latent_image)
 
+    # Before the guider takes the MODEL: strip any foreign dynamic
+    # denoise-mask patch (F3-14 — the burn class this pass must never
+    # inherit; see _strip_foreign_denoise_mask_patch).
+    model = _strip_foreign_denoise_mask_patch(model)
     guider = _make_guider(model, positive, negative, cfg)
     noise_mask = latent.get("noise_mask")
     x0_output: dict[str, Any] = {}
